@@ -1,6 +1,12 @@
 import concurrent.futures
 import copy
+from collections.abc import Generator
+from functools import reduce
+from io import BytesIO
 from typing import Any, Optional
+
+from pydub import AudioSegment
+
 from dify_plugin.entities.model import AIModelEntity
 from dify_plugin.errors.model import (
     CredentialsValidateFailedError,
@@ -63,18 +69,87 @@ class AzureOpenAIText2SpeechModel(_CommonAzureOpenAI, TTSModel):
         except Exception as ex:
             raise CredentialsValidateFailedError(str(ex))
 
-    def _tts_invoke_streaming(
+    def _tts_invoke(
         self, model: str, credentials: dict, content_text: str, voice: str
-    ) -> Any:
+    ) -> bytes:
         """
-        _tts_invoke_streaming text2speech model
+        Non-streaming TTS invoke. Splits text into sentences, fetches audio
+        for each in parallel, then combines segments with pydub to produce a
+        correctly formatted audio file.
+
         :param model: model name
         :param credentials: model credentials
         :param content_text: text content to be translated
         :param voice: model timbre
-        :return: text translated to audio file
+        :return: combined audio bytes
+        """
+        audio_type = self._get_model_audio_type(model, credentials)
+        word_limit = self._get_model_word_limit(model, credentials) or 500
+        max_workers = self._get_model_workers_limit(model, credentials)
+
+        try:
+            sentences = list(
+                self._split_text_into_sentences(
+                    org_text=content_text, max_length=word_limit
+                )
+            )
+            audio_bytes_list: list[bytes] = []
+
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max_workers
+            ) as executor:
+                futures = [
+                    executor.submit(
+                        self._process_sentence,
+                        sentence=sentence,
+                        model=model,
+                        voice=voice,
+                        credentials=credentials,
+                    )
+                    for sentence in sentences
+                ]
+                for future in futures:
+                    try:
+                        result = future.result()
+                        if result:
+                            audio_bytes_list.append(result)
+                    except Exception as ex:
+                        raise InvokeBadRequestError(str(ex))
+
+            if not audio_bytes_list:
+                raise InvokeBadRequestError("No audio bytes found")
+
+            # Combine segments with pydub, then re-export in target format.
+            audio_segments = [
+                AudioSegment.from_file(BytesIO(buf), format=audio_type)
+                for buf in audio_bytes_list
+                if buf
+            ]
+            combined = reduce(lambda a, b: a + b, audio_segments)
+            buffer = BytesIO()
+            combined.export(buffer, format=audio_type)
+            buffer.seek(0)
+            return buffer.read()
+
+        except InvokeBadRequestError:
+            raise
+        except Exception as ex:
+            raise InvokeBadRequestError(str(ex))
+
+    def _tts_invoke_streaming(
+        self, model: str, credentials: dict, content_text: str, voice: str
+    ) -> Generator[bytes, None, None]:
+        """
+        Streaming TTS invoke.
+
+        :param model: model name
+        :param credentials: model credentials
+        :param content_text: text content to be translated
+        :param voice: model timbre
+        :return: generator of audio byte chunks
         """
         try:
+            audio_type = self._get_model_audio_type(model, credentials)
             client = self._create_client(credentials)
             max_length = 3500
             if len(content_text) > max_length:
@@ -88,7 +163,7 @@ class AzureOpenAIText2SpeechModel(_CommonAzureOpenAI, TTSModel):
                     executor.submit(
                         client.audio.speech.with_streaming_response.create,
                         model=model,
-                        response_format="mp3",
+                        response_format=audio_type,
                         input=sentences[i],
                         voice=voice,
                     )
@@ -100,7 +175,7 @@ class AzureOpenAIText2SpeechModel(_CommonAzureOpenAI, TTSModel):
                 response = client.audio.speech.with_streaming_response.create(
                     model=model,
                     voice=voice,
-                    response_format="mp3",
+                    response_format=audio_type,
                     input=content_text.strip(),
                 )
                 yield from response.__enter__().iter_bytes(1024)
@@ -109,17 +184,21 @@ class AzureOpenAIText2SpeechModel(_CommonAzureOpenAI, TTSModel):
 
     def _process_sentence(self, sentence: str, model: str, voice, credentials: dict):
         """
-        _tts_invoke openai text2speech model api
+        Invoke Azure OpenAI TTS API for a single sentence.
 
         :param model: model name
         :param credentials: model credentials
         :param voice: model timbre
         :param sentence: text content to be translated
-        :return: text translated to audio file
+        :return: audio bytes
         """
+        audio_type = self._get_model_audio_type(model, credentials)
         client = self._create_client(credentials)
         response = client.audio.speech.create(
-            model=model, voice=voice, input=sentence.strip()
+            model=model,
+            voice=voice,
+            input=sentence.strip(),
+            response_format=audio_type,
         )
         if isinstance(response.read(), bytes):
             return response.read()
